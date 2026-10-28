@@ -1,0 +1,5 @@
+10/27/2026:
+1. the goal is to create a web crawler using modern c++ and full systems design critical thinking.
+2. the initial challenge, i've mostly worked with c++17 and previous versions, so i am challenging myself to use c++23. i also am starting out with very little knowledge on what a web crawler is.
+3. no raw pointers, utilize smart pointers.
+4. i've never used boost before but a friend recommended it to me for my situation, plus, boost is a very prominent library so its good experience.
