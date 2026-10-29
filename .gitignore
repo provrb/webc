@@ -1,0 +1,10 @@
+build*/
+vcpkg_installed/
+.cache/
+.DS_Store
+
+# local crawler database
+webcs
+webcs-journal
+webcs-wal
+webcs-shm
