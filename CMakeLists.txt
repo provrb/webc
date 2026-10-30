@@ -14,7 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Boost CONFIG REQUIRED COMPONENTS asio beast)
+find_package(Boost CONFIG REQUIRED COMPONENTS asio beast url)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(lexbor CONFIG REQUIRED)
@@ -25,5 +25,6 @@ file(GLOB HEADERS "include/*.h")
 add_executable(main ${SOURCES} ${HEADERS})
 
 target_include_directories(main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(main PRIVATE Boost::asio Boost::beast unofficial::sqlite3::sqlite3
+target_link_libraries(main PRIVATE Boost::asio Boost::beast Boost::url
+                                   unofficial::sqlite3::sqlite3
                                    OpenSSL::Crypto lexbor::lexbor_static)

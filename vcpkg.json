@@ -5,6 +5,7 @@
   "dependencies": [
     "boost-asio",
     "boost-beast",
+    "boost-url",
     "lexbor",
     "openssl",
     "sqlite3"
