@@ -80,8 +80,6 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 namespace asio = boost::asio;
 
-constexpr size_t MAX_DEPTH = 5;
-
 class Crawler {
 public:
   explicit Crawler(std::string start_address)
@@ -89,8 +87,6 @@ public:
         tcp_stream_(ioc_) {
     std::println("[crawler] init with start address: `{}`", start_addr_);
   }
-
-  auto filter_links(this auto &self) -> std::vector<boost::urls::url> {}
 
   [[nodiscard]] static auto resolve_link(const boost::urls::url_view &page,
                                          std::string_view href)
@@ -126,9 +122,8 @@ public:
       const boost::urls::url boost_url = boost_url_res.value();
       std::println("{}", boost_url.data());
 
-      if (!self.visited_.insert(boost_url.data()).second) {
-        continue;
-      }
+      // if (!self.visited_.insert(boost_url.data()).second)
+      //  continue;
 
       http::response<http::dynamic_body> page_response;
       try {
@@ -196,10 +191,6 @@ public:
         // stay on the site we started on
         if (resolved->host() != self.addr_host_)
           continue;
-
-        if (self.visited_.contains(resolved.value().data())) {
-          continue;
-        }
 
         links_to_visit.push(std::make_pair(resolved.value().data(), depth + 1));
       }

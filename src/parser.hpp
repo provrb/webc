@@ -117,8 +117,8 @@ public:
         query_selectors(doc.get(), SEL_NAME, DomContentPreference::ATTRIBUTE);
     std::vector<std::string> all_prices =
         query_selectors(doc.get(), SEL_PRICE, DomContentPreference::TEXT);
-    std::vector<std::string> all_descriptions = query_selectors(
-        doc.get(), SEL_DESCRIPTION, DomContentPreference::ATTRIBUTE);
+    std::vector<std::string> all_descriptions =
+        query_selectors(doc.get(), SEL_DESCRIPTION, DomContentPreference::TEXT);
 
     size_t upper_bound = std::max(
         {all_names.size(), all_prices.size(), all_descriptions.size()});
@@ -139,8 +139,8 @@ public:
 
       ProductSchema ps;
       ps.price = std::move(price);
-      ps.listing_name = name.value_or("");
-      ps.listing_description = description.value_or("");
+      ps.listing_name = std::move(name.value_or(""));
+      ps.listing_description = std::move(description.value_or(""));
       products.push_back(std::move(ps));
     }
     return products;
@@ -156,8 +156,6 @@ public:
 
     std::vector<std::string> links =
         query_selectors(doc.get(), SEL_LINK, DomContentPreference::HREF);
-    std::println("[parser] ran query_selectors for all href. found {}",
-                 links.size());
 
     return links;
   }
@@ -217,10 +215,10 @@ private:
         }
       }();
 
-      if (dom_content)
+      if (dom_content) {
         field.assign(reinterpret_cast<const char *>(dom_content), content_len);
-
-      parsed.push_back(std::move(field));
+        parsed.push_back(std::move(field));
+      }
     }
     return parsed;
   }
