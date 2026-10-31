@@ -90,22 +90,19 @@ enum class DomContentPreference {
 
 class Parser {
 public:
-  Parser(const Parser &) = delete;
-  Parser &operator=(Parser &&) = delete;
-
-  static auto get() -> Parser & {
-    static Parser inst;
-    return inst;
+  Parser() : css(lxb_css_parser_create()), selectors(lxb_selectors_create()) {
+    lxb_css_parser_init(css.get(), nullptr);
+    lxb_selectors_init(selectors.get());
   }
 
-  [[nodiscard]] static auto get_css() -> const CssParser_ & {
-    return get().css;
+  [[nodiscard]] auto get_css(this auto &self) -> const CssParser_ & {
+    return self.css;
   }
-  [[nodiscard]] static auto get_selectors() -> const Selectors_ & {
-    return get().selectors;
+  [[nodiscard]] auto get_selectors(this auto &self) -> const Selectors_ & {
+    return self.selectors;
   }
 
-  [[nodiscard]] static auto
+  [[nodiscard]] auto
   extract_all_matching(std::string_view html_content) noexcept
       -> const std::vector<ProductSchema> {
     HtmlDoc_ doc(lxb_html_document_create(), lxb_html_document_destroy);
@@ -146,8 +143,8 @@ public:
     return products;
   }
 
-  [[nodiscard]] static auto
-  extract_links(std::string_view html_content) noexcept
+  [[nodiscard]] auto extract_links(this auto &self,
+                                   std::string_view html_content) noexcept
       -> std::vector<std::string> {
     HtmlDoc_ doc(lxb_html_document_create(), lxb_html_document_destroy);
     lxb_html_document_parse(
@@ -155,7 +152,7 @@ public:
         html_content.size());
 
     std::vector<std::string> links =
-        query_selectors(doc.get(), SEL_LINK, DomContentPreference::HREF);
+        self.query_selectors(doc.get(), SEL_LINK, DomContentPreference::HREF);
 
     return links;
   }
@@ -170,21 +167,22 @@ private:
   }
 
   // returns all the text values for the selector like a query.
-  [[nodiscard]] static auto
-  query_selectors(lxb_html_document_t *doc, std::string_view selector,
+  [[nodiscard]] auto
+  query_selectors(this auto &self, lxb_html_document_t *doc,
+                  std::string_view selector,
                   DomContentPreference content_preference) noexcept
       -> std::vector<std::string> {
     SelectorList_ list{lxb_css_selectors_parse(
-        get_css().get(), reinterpret_cast<const lxb_char_t *>(selector.data()),
+        self.css.get(), reinterpret_cast<const lxb_char_t *>(selector.data()),
         selector.size())};
 
-    get_css()->memory = nullptr;
+    self.css->memory = nullptr;
     auto *root = lxb_dom_document_element(&doc->dom_document);
     if (!list || root == nullptr)
       return std::vector<std::string>();
 
     std::vector<lxb_dom_node_t *> matching_nodes;
-    lxb_selectors_find(get_selectors().get(), lxb_dom_interface_node(root),
+    lxb_selectors_find(self.selectors.get(), lxb_dom_interface_node(root),
                        list.get(), collect_node_callback, &matching_nodes);
 
     // parse the text from nodes
@@ -222,12 +220,6 @@ private:
     }
     return parsed;
   }
-
-  Parser() : css(lxb_css_parser_create()), selectors(lxb_selectors_create()) {
-    lxb_css_parser_init(css.get(), nullptr);
-    lxb_selectors_init(selectors.get());
-  }
-  ~Parser() = default;
 
   CssParser_ css;
   Selectors_ selectors;

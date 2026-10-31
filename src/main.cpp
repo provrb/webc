@@ -1,3 +1,4 @@
+#include <atomic>
 #include <boost/beast/core/buffers_to_string.hpp>
 #include <boost/url/impl/parse.hpp>
 #include <boost/url/url_base.hpp>
@@ -5,10 +6,12 @@
 #include <chrono>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <print>
 #include <queue>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -32,6 +35,7 @@
 #include "boost/system/system_error.hpp"
 #include <boost/url/url.hpp>
 
+#include "concurrentqueue.h"
 #include "indexer.hpp"
 #include "parser.hpp"
 
@@ -81,13 +85,28 @@ namespace http = beast::http;
 namespace asio = boost::asio;
 
 static inline constexpr size_t MAX_BATCH_SIZE = 500;
+static inline constexpr size_t NUM_WORKERS = 45;
+static inline constexpr size_t MAX_DEPTH = 100;
+static inline moodycamel::ConcurrentQueue<std::pair<boost::urls::url, size_t>>
+    cc_links_to_visit;
+
+// every url ever queued, shared by all workers so a page is only crawled once.
+// marked when the url is enqueued
+static inline std::unordered_set<boost::urls::url> visited;
+static inline std::mutex visited_mutex;
+
+// how many workers are in the middle of a page. an empty queue only means the
+// crawl is over when this is 0, otherwise a worker may still enqueue links
+static inline std::atomic<size_t> in_flight = 0;
 
 class Crawler {
 public:
-  explicit Crawler(std::string start_address)
+  explicit Crawler(std::string start_address,
+                   indexer::DatabaseConnection &database_connection)
       : start_addr_(std::move(start_address)), tcp_resolver_(ioc_),
-        tcp_stream_(ioc_), database(indexer::DatabaseConnection()) {
+        tcp_stream_(ioc_), database(database_connection) {
     batch_to_insert_.reserve(MAX_BATCH_SIZE);
+    crawler_parser = parser::Parser();
     std::println("[crawler] init with start address: `{}`", start_addr_);
   }
 
@@ -111,20 +130,25 @@ public:
   }
 
   auto breadth(this auto &self) -> void {
-    std::queue<std::pair<boost::urls::url, size_t>> links_to_visit;
-    links_to_visit.push(std::make_pair(self.base_addr_.value(), 0));
+    std::pair<boost::urls::url, size_t> next_link = {};
 
-    while (!links_to_visit.empty()) {
-      std::pair<boost::urls::url, size_t> next_link = links_to_visit.front();
-      links_to_visit.pop();
+    while (true) {
+      ++in_flight;
+      if (!cc_links_to_visit.try_dequeue(next_link)) {
+        --in_flight;
+        if (in_flight == 0 && cc_links_to_visit.size_approx() == 0)
+          break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
+      }
+      struct InFlightGuard {
+        ~InFlightGuard() { --in_flight; }
+      } in_flight_guard;
 
       const boost::urls::url current_url = std::move(next_link.first);
       const size_t depth = std::move(next_link.second);
 
-      if (!self.visited_.insert(current_url).second)
-        continue;
-
-      // std::println("{}", boost_url.data());
+      std::println("{}", current_url.data());
       http::response<http::string_body> page_response;
       try {
         page_response = self.get_webpage_content(current_url);
@@ -144,7 +168,7 @@ public:
 
       const std::string response_body = page_response.body();
       std::vector<parser::ProductSchema> schemas =
-          parser::Parser::extract_all_matching(response_body);
+          self.crawler_parser.extract_all_matching(response_body);
 
       std::expected<indexer::WebpageEntry, uint64_t> current_webpage_entry_res =
           indexer::WebpageEntry::create(current_url.data(), schemas);
@@ -162,23 +186,30 @@ public:
 
       self.insert_into_batch(current_webpage_entry);
 
+      if (depth >= MAX_DEPTH)
+        continue;
+
       std::vector<std::string> links =
-          parser::Parser::extract_links(response_body);
+          self.crawler_parser.extract_links(response_body);
 
       for (const auto &l : links) {
         const auto resolved = resolve_link(current_url, l);
         if (!resolved.has_value())
           continue;
 
-        if (self.visited_.contains(resolved.value()))
-          continue;
-
         // stay on the site we started on
         if (resolved->host() != self.addr_host_)
           continue;
 
-        links_to_visit.push(std::make_pair(resolved.value(), depth + 1));
+        {
+          std::lock_guard lock(visited_mutex);
+          if (!visited.insert(resolved.value()).second)
+            continue;
+        }
+
+        cc_links_to_visit.enqueue(std::make_pair(resolved.value(), depth + 1));
       }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     self.flush_batch();
@@ -230,13 +261,11 @@ public:
   [[nodiscard]] auto get_webpage_content(this auto &self,
                                          const boost::urls::url_view &url)
       -> http::response<http::string_body> {
-    // the server closed the last connection: reuse the resolved addresses
     if (!self.connected_) {
       self.tcp_stream_.connect(self.endpoints_);
       self.connected_ = true;
     }
 
-    // path + query, e.g. "/catalogue/page-2.html?x=1"
     std::string target(url.encoded_target());
     if (target.empty())
       target = "/";
@@ -280,7 +309,8 @@ private:
     self.batch_to_insert_.clear();
   }
 
-  indexer::DatabaseConnection database;
+  indexer::DatabaseConnection &database;
+  parser::Parser crawler_parser;
 
   std::string start_addr_; // contains "http" - website link we start on
   std::string addr_host_;
@@ -293,17 +323,47 @@ private:
   asio::ip::tcp::resolver::results_type endpoints_;
   bool connected_ = false;
 
-  std::unordered_set<boost::urls::url> visited_;
-  std::queue<std::pair<boost::urls::url, size_t>> to_visit_;
   std::vector<indexer::WebpageEntry> batch_to_insert_;
 };
 
 auto main() -> int {
-  // using some random book web scraping page as a test
-  Crawler c("http://books.toscrape.com");
+  constexpr std::string_view seed_address = "http://books.toscrape.com";
+
+  // single connection
+  indexer::DatabaseConnection db;
+
+  const auto seed_res = boost::urls::parse_uri(seed_address);
+  if (!seed_res.has_value()) {
+    std::println(stderr, "[main] seed address `{}` is not a valid url: {}",
+                 seed_address, seed_res.error().message());
+    return 1;
+  }
+  boost::urls::url seed = seed_res.value();
+  if (seed.path().empty())
+    seed.set_path("/");
+  seed.normalize();
+  visited.insert(seed);
+  cc_links_to_visit.enqueue(std::make_pair(std::move(seed), 0));
+
+  std::vector<std::jthread> threads;
+
   auto s = std::chrono::high_resolution_clock::now();
   std::println("Start.\n");
-  c.start();
+  for (size_t i = 0; i < NUM_WORKERS; ++i)
+    threads.emplace_back([&db, seed_address] {
+      try {
+        Crawler crawler(std::string(seed_address), db);
+        crawler.start();
+      } catch (const std::exception &e) {
+        std::println(stderr, "[worker] stopped: {}", e.what());
+      }
+    });
+
+  for (auto &t : threads) {
+    if (t.joinable())
+      t.join();
+  }
+
   auto e = std::chrono::high_resolution_clock::now();
   std::println("End.\n");
 

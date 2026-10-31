@@ -16,6 +16,7 @@
 #include <expected>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <print>
 #include <stdexcept>
@@ -146,6 +147,9 @@ public:
   };
 
   auto save_webpage_vector(const std::vector<WebpageEntry> &wv) -> void {
+    // one connection is shared by every worker thread. only one of them may
+    // use it at a time, or two transactions would overlap
+    std::lock_guard lock(mutex_);
     std::println("[database::save_webpage_vector] saving {} webpages",
                  wv.size());
     try {
@@ -157,13 +161,14 @@ public:
                                  we.parsed_listings.end());
         return true;
       });
+      std::println("\tsuccess");
     } catch (const std::runtime_error &e) {
       std::println(stderr, "\tfailed. {}", e.what());
     }
-    std::println("\tsuccess");
   }
 
   auto save_webpage(const WebpageEntry &we) -> void {
+    std::lock_guard lock(mutex_);
     storage.replace(we);
     for (const auto &ps : we.parsed_listings) {
       storage.insert(ps);
@@ -172,6 +177,7 @@ public:
 
   [[nodiscard]] auto get_webpage(std::string_view url) noexcept
       -> std::optional<WebpageEntry> {
+    std::lock_guard lock(mutex_);
     try {
       const WebpageEntry webpage = storage.get<WebpageEntry>(
           sqlite_orm::where(sqlite_orm::c(&WebpageEntry::url) == url));
@@ -184,6 +190,7 @@ public:
 private:
   using Storage = decltype(init_storage());
   Storage storage;
+  std::mutex mutex_;
 };
 
 } // namespace indexer

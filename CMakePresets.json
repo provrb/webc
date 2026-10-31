@@ -2,15 +2,30 @@
   "version": 6,
   "configurePresets": [
     {
-      "name": "dev",
-      "displayName": "Debug (Ninja + clang, vcpkg)",
+      "name": "base",
+      "hidden": true,
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CXX_COMPILER": "clang++",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "inherits": "base",
+      "displayName": "Debug (Ninja + clang, vcpkg)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release (Ninja + clang, vcpkg)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
       }
     }
   ],
@@ -18,6 +33,10 @@
     {
       "name": "dev",
       "configurePreset": "dev"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
     }
   ]
 }
