@@ -2,6 +2,7 @@
 #include <boost/url/impl/parse.hpp>
 #include <boost/url/url_base.hpp>
 #include <boost/url/url_view.hpp>
+#include <chrono>
 #include <iostream>
 #include <iterator>
 #include <optional>
@@ -9,6 +10,7 @@
 #include <queue>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
 // boost/beast
 #include "boost/beast/core/flat_buffer.hpp"
@@ -28,9 +30,7 @@
 #include <boost/asio/ip/tcp.hpp>
 
 #include "boost/system/system_error.hpp"
-
 #include <boost/url/url.hpp>
-#include <utility>
 
 #include "indexer.hpp"
 #include "parser.hpp"
@@ -80,11 +80,14 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 namespace asio = boost::asio;
 
+static inline constexpr size_t MAX_BATCH_SIZE = 500;
+
 class Crawler {
 public:
   explicit Crawler(std::string start_address)
       : start_addr_(std::move(start_address)), tcp_resolver_(ioc_),
-        tcp_stream_(ioc_) {
+        tcp_stream_(ioc_), database(indexer::DatabaseConnection()) {
+    batch_to_insert_.reserve(MAX_BATCH_SIZE);
     std::println("[crawler] init with start address: `{}`", start_addr_);
   }
 
@@ -108,77 +111,56 @@ public:
   }
 
   auto breadth(this auto &self) -> void {
-    std::queue<std::pair<std::string, size_t>> links_to_visit;
-    links_to_visit.push(std::make_pair(self.start_addr_, 0));
+    std::queue<std::pair<boost::urls::url, size_t>> links_to_visit;
+    links_to_visit.push(std::make_pair(self.base_addr_.value(), 0));
 
     while (!links_to_visit.empty()) {
-      std::pair<std::string, size_t> next_link = links_to_visit.front();
+      std::pair<boost::urls::url, size_t> next_link = links_to_visit.front();
       links_to_visit.pop();
 
-      const std::string current_url = next_link.first;
-      const size_t depth = next_link.second;
-      const auto boost_url_res =
-          resolve_link(self.base_addr_.value(), current_url);
-      const boost::urls::url boost_url = boost_url_res.value();
-      std::println("{}", boost_url.data());
+      const boost::urls::url current_url = std::move(next_link.first);
+      const size_t depth = std::move(next_link.second);
 
-      // if (!self.visited_.insert(boost_url.data()).second)
-      //  continue;
+      if (!self.visited_.insert(current_url).second)
+        continue;
 
-      http::response<http::dynamic_body> page_response;
+      // std::println("{}", boost_url.data());
+      http::response<http::string_body> page_response;
       try {
-        page_response = self.get_webpage_content(boost_url);
+        page_response = self.get_webpage_content(current_url);
       } catch (const boost::system::system_error &e) {
-        std::println(stderr, "[crawler] fetching `{}` failed: {}", current_url,
-                     e.what());
+        std::println(stderr, "[crawler] fetching `{}` failed: {}",
+                     current_url.data(), e.what());
         self.tcp_stream_.close();
         self.connected_ = false;
         continue;
       }
 
       if (page_response.result() != http::status::ok) {
-        std::println(stderr, "[crawler] `{}` returned status {}", current_url,
-                     page_response.result_int());
+        std::println(stderr, "[crawler] `{}` returned status {}",
+                     current_url.data(), page_response.result_int());
         continue;
       }
 
-      const std::string response_body =
-          beast::buffers_to_string(page_response.body().data());
+      const std::string response_body = page_response.body();
       std::vector<parser::ProductSchema> schemas =
           parser::Parser::extract_all_matching(response_body);
 
       std::expected<indexer::WebpageEntry, uint64_t> current_webpage_entry_res =
-          indexer::WebpageEntry::create(boost_url.data(), schemas);
+          indexer::WebpageEntry::create(current_url.data(), schemas);
 
       if (!current_webpage_entry_res.has_value()) {
         std::println(stderr,
                      "[crawler] webpage::create() for url `{}` failed with "
                      "openssl code `{}`",
-                     current_url, current_webpage_entry_res.error());
+                     current_url.data(), current_webpage_entry_res.error());
         continue;
       }
 
       indexer::WebpageEntry current_webpage_entry =
           current_webpage_entry_res.value();
 
-      // check for duplicates in database to see if we scraped an update version
-      auto existing_url_extracts =
-          indexer::Database::get().get_webpages(boost_url.data());
-
-      if (existing_url_extracts.size() <= 0) {
-        // no existing webpage in. save initial one
-        indexer::Database::get().save_webpage(current_webpage_entry);
-      } else {
-        // this url is already in the database.
-        // check if our hash is the same
-        for (const indexer::WebpageEntry &we : existing_url_extracts) {
-          if (we.webpage_hash != current_webpage_entry.webpage_hash) {
-            // update this url's old parsed listings with the new one
-            indexer::Database::get().remove_webpage(we.url);
-            indexer::Database::get().save_webpage(current_webpage_entry);
-          }
-        }
-      }
+      self.insert_into_batch(current_webpage_entry);
 
       std::vector<std::string> links =
           parser::Parser::extract_links(response_body);
@@ -188,13 +170,18 @@ public:
         if (!resolved.has_value())
           continue;
 
+        if (self.visited_.contains(resolved.value()))
+          continue;
+
         // stay on the site we started on
         if (resolved->host() != self.addr_host_)
           continue;
 
-        links_to_visit.push(std::make_pair(resolved.value().data(), depth + 1));
+        links_to_visit.push(std::make_pair(resolved.value(), depth + 1));
       }
     }
+
+    self.flush_batch();
   }
 
   /*
@@ -242,7 +229,7 @@ public:
 
   [[nodiscard]] auto get_webpage_content(this auto &self,
                                          const boost::urls::url_view &url)
-      -> http::response<http::dynamic_body> {
+      -> http::response<http::string_body> {
     // the server closed the last connection: reuse the resolved addresses
     if (!self.connected_) {
       self.tcp_stream_.connect(self.endpoints_);
@@ -259,7 +246,7 @@ public:
     req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
     http::write(self.tcp_stream_, req);
 
-    http::response<http::dynamic_body> response;
+    http::response<http::string_body> response;
     beast::flat_buffer buffer;
 
     http::read(self.tcp_stream_, buffer, response);
@@ -272,9 +259,33 @@ public:
   }
 
 private:
-  std::string start_addr_;
+  auto insert_into_batch(this auto &self, indexer::WebpageEntry entry) noexcept
+      -> void {
+    // check if this page we want to add to the batch already exists in the
+    // database. if the page exists, check the pages hash between the hash of
+    // the new page. if they differ then add the updated webpage `entry`
+    const auto existing = self.database.get_webpage(entry.url);
+    if (existing.has_value() && existing->webpage_hash == entry.webpage_hash)
+      return;
+
+    self.batch_to_insert_.push_back(std::move(entry));
+    if (self.batch_to_insert_.size() >= MAX_BATCH_SIZE)
+      self.flush_batch();
+  }
+
+  auto flush_batch(this auto &self) noexcept -> void {
+    if (self.batch_to_insert_.empty())
+      return;
+    self.database.save_webpage_vector(self.batch_to_insert_);
+    self.batch_to_insert_.clear();
+  }
+
+  indexer::DatabaseConnection database;
+
+  std::string start_addr_; // contains "http" - website link we start on
   std::string addr_host_;
-  std::optional<boost::urls::url> base_addr_;
+  std::optional<boost::urls::url>
+      base_addr_; // start_addr as a boost::url, never changes. contains "http"
 
   asio::io_context ioc_;
   asio::ip::tcp::resolver tcp_resolver_;
@@ -282,14 +293,22 @@ private:
   asio::ip::tcp::resolver::results_type endpoints_;
   bool connected_ = false;
 
-  std::unordered_set<std::string> visited_;
-  std::queue<std::pair<std::string, size_t>> to_visit_;
+  std::unordered_set<boost::urls::url> visited_;
+  std::queue<std::pair<boost::urls::url, size_t>> to_visit_;
+  std::vector<indexer::WebpageEntry> batch_to_insert_;
 };
 
 auto main() -> int {
   // using some random book web scraping page as a test
   Crawler c("http://books.toscrape.com");
+  auto s = std::chrono::high_resolution_clock::now();
+  std::println("Start.\n");
   c.start();
+  auto e = std::chrono::high_resolution_clock::now();
+  std::println("End.\n");
+
+  auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(e - s);
+  std::println("Elapsed: {}", elapsed.count());
 
   return 0;
 }

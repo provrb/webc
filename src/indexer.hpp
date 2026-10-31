@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <print>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -42,7 +43,7 @@ public:
   [[nodiscard]] static inline auto
   create(std::string url,
          std::vector<parser::ProductSchema> parsed_listings) noexcept
-      -> std::expected<const WebpageEntry, uint64_t> {
+      -> std::expected<WebpageEntry, uint64_t> {
     // normalize url (all lowercase)
     std::transform(url.begin(), url.end(), url.begin(), [](unsigned char c) {
       return static_cast<char>(std::tolower(c));
@@ -104,37 +105,11 @@ public:
   std::vector<parser::ProductSchema> parsed_listings;
 };
 
-class Database {
-public:
-  Database(const Database &) = delete;
-  Database &operator=(Database &&) = delete;
+static constexpr std::string_view STORAGE_FILE_NAME = "webc.db";
 
-  static auto get() -> Database & {
-    static Database inst;
-    return inst;
-  }
-
-  static auto save_webpage(const WebpageEntry &we) -> void {
-    storage.replace(we);
-    for (const auto &ps : we.parsed_listings) {
-      storage.insert(ps);
-    }
-  }
-
-  [[nodiscard]] static inline auto get_webpages(std::string_view url)
-      -> std::vector<WebpageEntry> {
-    return storage.get_all<WebpageEntry>(
-        sqlite_orm::where(sqlite_orm::c(&WebpageEntry::url) == url));
-  }
-
-  static inline auto remove_webpage(std::string_view url) {
-    storage.remove<WebpageEntry>(url);
-  }
-
-private:
-  static constexpr inline std::string_view storage_name = "webcs.db";
-  static inline auto storage = sqlite_orm::make_storage(
-      std::string{storage_name},
+inline auto init_storage() -> auto {
+  return sqlite_orm::make_storage(
+      std::string(STORAGE_FILE_NAME),
       sqlite_orm::make_table(
           "webpages",
           sqlite_orm::make_column("url", &WebpageEntry::url,
@@ -160,9 +135,55 @@ private:
           sqlite_orm::foreign_key(&parser::ProductSchema::webpage_url)
               .references(&WebpageEntry::url)
               .on_delete.cascade()));
+}
 
-  Database() { storage.sync_schema(); };
-  ~Database() = default;
+class DatabaseConnection {
+public:
+  DatabaseConnection() : storage(init_storage()) {
+    storage.pragma.journal_mode(sqlite_orm::journal_mode::WAL);
+    storage.pragma.synchronous(1);
+    storage.sync_schema();
+  };
+
+  auto save_webpage_vector(const std::vector<WebpageEntry> &wv) -> void {
+    std::println("[database::save_webpage_vector] saving {} webpages",
+                 wv.size());
+    try {
+      storage.transaction([&] {
+        storage.replace_range(wv.begin(), wv.end());
+        for (const auto &we : wv)
+          if (!we.parsed_listings.empty())
+            storage.insert_range(we.parsed_listings.begin(),
+                                 we.parsed_listings.end());
+        return true;
+      });
+    } catch (const std::runtime_error &e) {
+      std::println(stderr, "\tfailed. {}", e.what());
+    }
+    std::println("\tsuccess");
+  }
+
+  auto save_webpage(const WebpageEntry &we) -> void {
+    storage.replace(we);
+    for (const auto &ps : we.parsed_listings) {
+      storage.insert(ps);
+    }
+  }
+
+  [[nodiscard]] auto get_webpage(std::string_view url) noexcept
+      -> std::optional<WebpageEntry> {
+    try {
+      const WebpageEntry webpage = storage.get<WebpageEntry>(
+          sqlite_orm::where(sqlite_orm::c(&WebpageEntry::url) == url));
+      return webpage;
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+
+private:
+  using Storage = decltype(init_storage());
+  Storage storage;
 };
 
 } // namespace indexer
